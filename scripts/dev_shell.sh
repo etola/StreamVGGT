@@ -15,7 +15,8 @@ echo "       Data dir:    $DATA_DIR"
 
 docker run --rm -it --gpus all \
   -v "$ROOT_DIR":/workspace/StreamVGGT \
-  -v "$DATA_DIR":/data \
+  -v "$DATA_DIR":/working \
   --workdir /workspace/StreamVGGT \
-  streamvggt:latest \
+  streamvggt \
+  --user $(id -u):$(id -g) \
   bash
