@@ -42,6 +42,7 @@ DOCKER_ARGS=(
   -v "$HOST_DIR":/working
   --workdir /workspace/StreamVGGT
   -e MPLCONFIGDIR=/tmp/matplotlib
+  --user $(id -u):$(id -g)
   -e CUDA_LAUNCH_BLOCKING=1
 )
 

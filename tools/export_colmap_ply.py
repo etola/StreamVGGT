@@ -21,6 +21,7 @@ from pathlib import Path
 
 # Add src to path to import project modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'datasets_preprocess'))
 
 # Import torch and other ML dependencies
 try:
@@ -30,6 +31,8 @@ try:
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
     import trimesh
     from visual_util import predictions_to_glb
+    # Import COLMAP utilities
+    from read_write_model import Camera, Image, Point3D, write_cameras_text, write_images_text, write_points3D_text, rotmat2qvec
 except ImportError as e:
     print(f"Error importing required modules: {e}")
     print("Make sure you have installed all requirements and the PYTHONPATH is set correctly.")
@@ -252,33 +255,280 @@ def export_predictions_to_ply(target_dir, out_dir=None, conf_thres=50.0):
     print(f"Successfully exported {len(combined_cloud.vertices)} points to {output_file}")
     return True
 
+
+def export_colmap_sparse(predictions, out_dir, image_names):
+    """Export predictions to COLMAP sparse format with proper multi-view correspondences."""
+    
+    print("Exporting to COLMAP sparse format...")
+    sparse_dir = os.path.join(out_dir, "sparse", "0")
+    os.makedirs(sparse_dir, exist_ok=True)
+    
+    # Get data from predictions
+    extrinsics = predictions["extrinsic"]  # (S, 3, 4)
+    intrinsics = predictions["intrinsic"]  # (S, 3, 3)
+    world_points = predictions["world_points"]  # (S, H, W, 3)
+    world_points_conf = predictions["world_points_conf"]  # (S, H, W)
+    images_tensor = predictions["images"]  # (S, 3, H, W)
+    
+    num_images = extrinsics.shape[0]
+    height, width = world_points.shape[1:3]
+    
+    print(f"Processing {num_images} images with resolution {width}x{height}")
+    
+    # 1. Create cameras.txt
+    cameras = {}
+    for i in range(num_images):
+        # Use SIMPLE_PINHOLE model (focal_length, cx, cy)
+        if intrinsics is not None:
+            fx = intrinsics[i, 0, 0]
+            fy = intrinsics[i, 1, 1]
+            cx = intrinsics[i, 0, 2]
+            cy = intrinsics[i, 1, 2]
+            focal = (fx + fy) / 2  # Average focal length for SIMPLE_PINHOLE
+            params = [focal, cx, cy]
+        else:
+            # Default intrinsics if not available
+            focal = min(width, height) * 0.7  # Rough estimate
+            params = [focal, width/2, height/2]
+        
+        camera = Camera(
+            id=i,
+            model="SIMPLE_PINHOLE",
+            width=width,
+            height=height,
+            params=params
+        )
+        cameras[i] = camera
+    
+    # 2. Sample 3D points from the first image and find correspondences in other images
+    print("Finding multi-view correspondences...")
+    
+    # Sample confident 3D points from the first image
+    ref_image_idx = 0
+    conf_threshold = np.percentile(world_points_conf[ref_image_idx].flatten(), 85)  # Top 15% confident points
+    conf_mask = world_points_conf[ref_image_idx] > conf_threshold
+    
+    # Get 2D coordinates and 3D points from reference image
+    y_coords, x_coords = np.where(conf_mask)
+    ref_points_3d = world_points[ref_image_idx][conf_mask]
+    
+    # Sample to avoid too many points (limit to ~500 points total)
+    if len(ref_points_3d) > 500:
+        indices = np.random.choice(len(ref_points_3d), 500, replace=False)
+        ref_points_3d = ref_points_3d[indices]
+        y_coords = y_coords[indices]
+        x_coords = x_coords[indices]
+    
+    print(f"Using {len(ref_points_3d)} reference 3D points from image {ref_image_idx}")
+    
+    # Get colors from reference image
+    ref_img_tensor = images_tensor[ref_image_idx]  # (3, H, W)
+    ref_img = ref_img_tensor.transpose(1, 2, 0)  # (H, W, 3)
+    ref_img = np.clip(ref_img, 0, 1)
+    ref_img_rgb = (ref_img * 255).astype(np.uint8)
+    
+    # For each reference 3D point, find correspondences in other images
+    valid_points_3d = []
+    valid_point_colors = []
+    valid_tracks = []  # List of (image_id, x, y) tuples for each 3D point
+    
+    for point_idx, (point_3d, ref_y, ref_x) in enumerate(zip(ref_points_3d, y_coords, x_coords)):
+        track = [(ref_image_idx, ref_x, ref_y)]  # Start with reference observation
+        
+        # Project this 3D point to all other camera views
+        for target_img_idx in range(1, num_images):
+            # Get camera parameters for target image
+            R_target = extrinsics[target_img_idx, :3, :3]
+            t_target = extrinsics[target_img_idx, :3, 3]
+            K_target = intrinsics[target_img_idx] if intrinsics is not None else cameras[target_img_idx]
+            
+            if not isinstance(K_target, np.ndarray):
+                K_target = np.array([[cameras[target_img_idx].params[0], 0, cameras[target_img_idx].params[1]], 
+                                   [0, cameras[target_img_idx].params[0], cameras[target_img_idx].params[2]], 
+                                   [0, 0, 1]])
+            
+            # Transform 3D point to target camera coordinates
+            point_3d_cam = R_target @ point_3d + t_target
+            
+            # Check if point is in front of camera
+            if point_3d_cam[2] <= 0:
+                continue
+                
+            # Project to image coordinates
+            x_proj = K_target[0, 0] * point_3d_cam[0] / point_3d_cam[2] + K_target[0, 2]
+            y_proj = K_target[1, 1] * point_3d_cam[1] / point_3d_cam[2] + K_target[1, 2]
+            
+            # Check if projection is within image bounds with some margin
+            margin = 10
+            if margin <= x_proj < width - margin and margin <= y_proj < height - margin:
+                # Check if there's a valid 3D point at this projected location
+                proj_x_int, proj_y_int = int(round(x_proj)), int(round(y_proj))
+                target_conf = world_points_conf[target_img_idx][proj_y_int, proj_x_int]
+                
+                # Only add to track if confidence is reasonable at projected location
+                if target_conf > conf_threshold * 0.5:  # Lower threshold for correspondences
+                    track.append((target_img_idx, x_proj, y_proj))
+        
+        # Only keep 3D points that are visible in at least 2 images
+        if len(track) >= 2:
+            valid_points_3d.append(point_3d)
+            
+            # Get color from reference image
+            rgb = ref_img_rgb[ref_y, ref_x]
+            if len(rgb.shape) == 0:
+                rgb = np.array([rgb, rgb, rgb])
+            elif len(rgb) != 3:
+                rgb = np.array([128, 128, 128])
+            valid_point_colors.append(rgb)
+            
+            valid_tracks.append(track)
+    
+    print(f"Found {len(valid_points_3d)} 3D points with multi-view correspondences")
+    
+    if len(valid_points_3d) == 0:
+        print("⚠️ No multi-view correspondences found! Using single-view points instead...")
+        # Fallback: use points from first image only
+        for point_idx, (point_3d, ref_y, ref_x) in enumerate(zip(ref_points_3d[:100], y_coords[:100], x_coords[:100])):
+            valid_points_3d.append(point_3d)
+            rgb = ref_img_rgb[ref_y, ref_x]
+            if len(rgb.shape) == 0:
+                rgb = np.array([rgb, rgb, rgb])
+            elif len(rgb) != 3:
+                rgb = np.array([128, 128, 128])
+            valid_point_colors.append(rgb)
+            valid_tracks.append([(ref_image_idx, ref_x, ref_y)])
+    
+    # 3. Create images.txt with proper 2D point correspondences
+    images = {}
+    
+    for i in range(num_images):
+        # Convert extrinsic matrix to COLMAP format (world-to-camera)
+        R = extrinsics[i, :3, :3]  # Rotation matrix
+        t = extrinsics[i, :3, 3]   # Translation vector
+        
+        # Convert rotation matrix to quaternion (w, x, y, z)
+        qvec = rotmat2qvec(R)
+        
+        # Get image name
+        if i < len(image_names):
+            image_name = os.path.basename(image_names[i])
+        else:
+            image_name = f"image_{i:04d}.jpg"
+        
+        # Collect 2D points for this image
+        image_2d_points = []
+        image_3d_point_ids = []
+        
+        for point_3d_id, track in enumerate(valid_tracks):
+            for track_entry in track:
+                if track_entry[0] == i:  # This 3D point is visible in image i
+                    image_2d_points.append([track_entry[1], track_entry[2]])
+                    image_3d_point_ids.append(point_3d_id)
+                    break  # Only one observation per 3D point per image
+        
+        # Convert to numpy arrays
+        if len(image_2d_points) > 0:
+            xys = np.array(image_2d_points)
+            point3D_ids = np.array(image_3d_point_ids, dtype=int)
+        else:
+            xys = np.zeros((0, 2))
+            point3D_ids = np.zeros(0, dtype=int)
+        
+        image = Image(
+            id=i,
+            qvec=qvec,
+            tvec=t,
+            camera_id=i,  # Each image has its own camera
+            name=image_name,
+            xys=xys,
+            point3D_ids=point3D_ids
+        )
+        images[i] = image
+    
+    # 4. Create points3D.txt with proper tracks
+    points3D = {}
+    
+    for point_3d_id, (point_3d, rgb, track) in enumerate(zip(valid_points_3d, valid_point_colors, valid_tracks)):
+        # Create track lists
+        track_image_ids = []
+        track_point2D_idxs = []
+        
+        for track_entry in track:
+            image_id = track_entry[0]
+            # Find the index of this 3D point in the image's 2D points
+            image_obj = images[image_id]
+            point_2d_indices = np.where(image_obj.point3D_ids == point_3d_id)[0]
+            
+            if len(point_2d_indices) > 0:
+                track_image_ids.append(image_id)
+                track_point2D_idxs.append(point_2d_indices[0])
+        
+        if len(track_image_ids) > 0:  # Only add points with valid tracks
+            point3d = Point3D(
+                id=point_3d_id,
+                xyz=point_3d,
+                rgb=rgb,
+                error=0.1,  # Dummy error
+                image_ids=np.array(track_image_ids),
+                point2D_idxs=np.array(track_point2D_idxs)
+            )
+            points3D[point_3d_id] = point3d
+    
+    # Write COLMAP files
+    print(f"Writing cameras.txt ({len(cameras)} cameras)...")
+    write_cameras_text(cameras, os.path.join(sparse_dir, "cameras.txt"))
+    
+    print(f"Writing images.txt ({len(images)} images)...")
+    write_images_text(images, os.path.join(sparse_dir, "images.txt"))
+    
+    print(f"Writing points3D.txt ({len(points3D)} points)...")
+    write_points3D_text(points3D, os.path.join(sparse_dir, "points3D.txt"))
+    
+    print(f"✅ COLMAP sparse reconstruction saved to: {sparse_dir}")
+    print(f"📊 Summary: {len(cameras)} cameras, {len(images)} images, {len(points3D)} 3D points")
+    
+    # Check for multi-view observations
+    total_observations = sum(len(img.point3D_ids) for img in images.values())
+    avg_track_length = total_observations / len(points3D) if len(points3D) > 0 else 0
+    print(f"📈 Total 2D-3D observations: {total_observations}")
+    print(f"📏 Average track length: {avg_track_length:.1f} views per 3D point")
+    
+    return sparse_dir
+
+
 def compute_predictions(target_dir):
     """
     Perform reconstruction using the already-created target_dir/images.
     """
     if not os.path.isdir(target_dir) or target_dir == "None":
-        return None, "No valid target directory found. Please upload first.", None, None
+        print("No valid target directory found.")
+        return None, None
 
     start_time = time.time()
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Prepare frame_filter dropdown
-    target_dir_images = os.path.join(target_dir, "images")
-    all_files = sorted(os.listdir(target_dir_images)) if os.path.isdir(target_dir_images) else []
-    all_files = [f"{i}: {filename}" for i, filename in enumerate(all_files)]
-    frame_filter_choices = ["All"] + all_files
-
     print("Running run_model...")
-    with torch.no_grad():
-        predictions = run_model(target_dir, model)
+    try:
+        with torch.no_grad():
+            predictions = run_model(target_dir, model)
+        
+        # Get image names for COLMAP export
+        image_names = glob.glob(os.path.join(target_dir, "images", "*"))
+        image_names = sorted(image_names)
 
-    return predictions
+        return predictions, image_names
+    except Exception as e:
+        print(f"Error during model inference: {e}")
+        return None, None
+
 
 def main():
     parser = argparse.ArgumentParser(description="Export StreamVGGT predictions to PLY format")
     parser.add_argument("--conf_thres", type=float, default=50.0, 
                        help="Confidence threshold for filtering points (default: 50.0)")
+    parser.add_argument("--export_colmap", action="store_true",
+                       help="Export COLMAP sparse reconstruction format")
     
     args = parser.parse_args()
     
@@ -290,25 +540,55 @@ def main():
 
     out_dir = os.path.join(target_dir, "output")
 
-    predictions = compute_predictions(target_dir)
+    predictions, image_names = compute_predictions(target_dir)
+    
+    if predictions is None:
+        print("❌ Failed to generate predictions!")
+        sys.exit(1)
+    
     # Save predictions
     predictions_file = os.path.join(out_dir, "predictions.npz")
     os.makedirs(out_dir, exist_ok=True)
     np.savez(predictions_file, **predictions)
 
+    success = False
+    
     if os.path.exists(predictions_file):
-        print("Found StreamVGGT predictions, exporting to PLY...")
-        success = export_predictions_to_ply(out_dir, out_dir, args.conf_thres)
+        print("Found StreamVGGT predictions, exporting...")
+        
+        # Export PLY format
+        print("📦 Exporting to PLY format...")
+        ply_success = export_predictions_to_ply(out_dir, out_dir, args.conf_thres)
+        
+        # Export COLMAP sparse format (always export for complete reconstruction)
+        print("🏗️ Exporting to COLMAP sparse format...")
+        try:
+            sparse_dir = export_colmap_sparse(predictions, out_dir, image_names)
+            colmap_success = True
+            print(f"✅ COLMAP sparse reconstruction exported to: {sparse_dir}")
+        except Exception as e:
+            print(f"❌ COLMAP export failed: {e}")
+            import traceback
+            traceback.print_exc()
+            colmap_success = False
+        
+        success = ply_success and colmap_success
+        
     else:
         print(f"Error: No supported data found in {target_dir}")
         print("Supported formats:")
         print("  - StreamVGGT predictions (predictions.npz)")
-        success = False
 
     if success:
-        print("Export completed successfully!")
+        print("\n🎉 Export completed successfully!")
+        print(f"📁 Outputs saved to: {out_dir}")
+        print("   📦 reconstruction.ply - Point cloud")
+        print("   🏗️ sparse/0/ - COLMAP reconstruction")
+        print("      - cameras.txt - Camera intrinsics")
+        print("      - images.txt - Camera poses") 
+        print("      - points3D.txt - 3D points")
     else:
-        print("Export failed!")
+        print("❌ Export failed!")
         sys.exit(1)
 
 
