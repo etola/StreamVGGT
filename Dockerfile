@@ -29,9 +29,11 @@ COPY requirements.txt requirements_demo.txt ./
 
 # Install Python packages directly to system Python
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124 && \
     pip install -r requirements.txt && \
     pip install -r requirements_demo.txt
+
+# Install Python packages directly to system Python
+RUN pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
 
 # Copy the rest of the application
 COPY . .
