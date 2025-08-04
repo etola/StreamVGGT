@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  streamvggt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: streamvggt:latest
+    container_name: streamvggt-gpu
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    ports:
+      - "7860:7860"
+    volumes:
+      # Mount for model checkpoints (persistent storage)
+      - ./ckpt:/workspace/StreamVGGT/ckpt
+      # Mount for data (if you have evaluation datasets)
+      - ./data:/workspace/StreamVGGT/data
+      # Mount for results/outputs
+      - ./outputs:/workspace/StreamVGGT/outputs
+    shm_size: 8gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
