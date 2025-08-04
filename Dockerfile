@@ -27,13 +27,13 @@ WORKDIR /workspace/StreamVGGT
 # Copy requirements first for better caching
 COPY requirements.txt requirements_demo.txt ./
 
-# Install Python packages directly to system Python
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install -r requirements.txt && \
-    pip install -r requirements_demo.txt
+# Install Python packages using python3.11 -m pip to ensure correct version
+RUN python3.11 -m pip install --upgrade pip setuptools wheel && \
+    python3.11 -m pip install -r requirements.txt && \
+    python3.11 -m pip install -r requirements_demo.txt
 
-# Install Python packages directly to system Python
-RUN pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
+# Install latest PyTorch with CUDA 12.4+ support for RTX 5080 (sm_120)
+RUN python3.11 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # Copy the rest of the application
 COPY . .

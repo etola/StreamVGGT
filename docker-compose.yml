@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: streamvggt:latest
+    image: streamvggt
     container_name: streamvggt-gpu
     runtime: nvidia
     environment:

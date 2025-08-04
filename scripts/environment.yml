@@ -1,0 +1,10 @@
+name: StreamVGGT
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - cmake=3.14.0
+  - pip
+  - llvm-openmp<16
+  - pip:
+      - -r requirements.txt
